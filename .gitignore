@@ -1,0 +1,18 @@
+# Data and build artefacts: regenerate with download_data.sh
+data/
+store/
+store_*/
+runs/
+experiment_campaigns/
+logs/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+.pytest_cache/
+
+# Never commit credentials
+.env
+*.key

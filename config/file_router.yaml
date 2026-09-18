@@ -1,0 +1,277 @@
+# =============================================================================
+# File_Router — cost-sensitive multimodal retrieval (ported from cnem_v)
+# Core idea: under "can answer", prefer cheaper evidence:
+#            caption (L1) < page screenshot (L0 visual) < full-page text (L0 text)
+# =============================================================================
+
+paths:
+  data_dir:   "./data"
+  raw_dir:    "./data/raw"
+  unified_dir: "./data/unified"
+  resources_dir: "./data/resources"
+  splits_dir: "./data/splits"
+  store_dir:  "./store"                 # per-dataset stores live under here
+  log_dir:    "./logs"
+  training_data_path: "./logs/router_training.jsonl"
+  router_model_dir:   "./store/router_model"
+
+# -----------------------------------------------------------------------------
+# Datasets — which to use, and per-dataset subset caps for laptop-scale runs.
+# -----------------------------------------------------------------------------
+datasets:
+  enabled: ["unidoc", "mmdocrag", "locomo_refined"]   # router-trainable ones
+  retrieval_only: ["vidore", "real_mm_rag"]           # eval-only (no gold groups)
+  subset_qa: 0                          # 0 = FULL (no truncation); >0 = small-subset
+  subset_docs: 12                       # (only used in subset mode)
+  unidoc_domain: "finance"              # which UniDoc domain to pull
+  real_mm_rag_repo: "ibm-research/REAL-MM-RAG_FinReport"
+
+# -----------------------------------------------------------------------------
+# Train / test split (reproducible, grouped by doc_id to prevent leakage)
+# -----------------------------------------------------------------------------
+split:
+  test_ratio: 0.2
+  seed: 42
+
+# -----------------------------------------------------------------------------
+# Encoders (all offline-light by default; swap backends here)
+# -----------------------------------------------------------------------------
+encoders:
+  text:
+    backend: "sentence-transformers"    # "sentence-transformers" | "stub"
+    model_name: "sentence-transformers/all-MiniLM-L6-v2"
+    device: "auto"                      # ENCODER_DEVICE can override
+    dim: 384
+  visual:
+    backend: "clip"                     # "clip" | "colpali" | "stub"
+    # transformers 5.x returns BaseModelOutputWithPooling from
+    # get_text_features / get_image_features instead of a tensor; the encoder
+    # now extracts text_embeds/image_embeds explicitly, so both versions work.
+    # scripts/check_visual_index.py verifies the store still matches the encoder.
+    clip_model_name: "openai/clip-vit-base-patch32"   # 512-d, needs torch>=2.6
+    colpali_model_name: "vidore/colpali-v1.2"
+    device: "auto"                      # use CUDA on the server when available
+    dim: 512
+    patch_grid: 32
+  # NOTE: there is no separate VLM/caption model. Captions are produced by the
+  # offline "heuristic" backend (see ingestion.caption). The ONLY LLM used by
+  # the whole pipeline is the answer generator in the `llm:` block at the bottom.
+
+# -----------------------------------------------------------------------------
+# Ingestion — builds the 3-tier cost ladder per PDF page
+# -----------------------------------------------------------------------------
+ingestion:
+  text:
+    chunk_chars: 1200
+    chunk_overlap: 200
+  pdf:
+    dpi: 150                            # page render resolution (lower = cheaper/faster)
+    max_pages_per_doc: 40
+    render_page_images: true           # set false to skip screenshots (text-only)
+  caption:
+    backend: "heuristic"               # "heuristic" (offline) | "vlm" (needs API key)
+    vlm_for_image_only: true            # generate a cached cheap tier for UniDoc pages
+    heuristic_max_chars: 240           # caption = first sentence/heading, capped
+  ocr:
+    # UniDoc pages carry no text layer, so without OCR their cost ladder has a
+    # hole: only a 240-char caption or a ~1540-token screenshot, nothing in
+    # between.  ablation_20260831_032319 traced 30 of the 36 caption-on-Gold-page
+    # failures to exactly that gap (UniDoc caption F1 0.22 vs screenshot 0.46).
+    # Where a middle rung does exist it is the best tier by a wide margin:
+    # pooled across arms, fulltext scored F1 0.3534 at cost 892 (F1/1k 0.3962)
+    # against caption 0.1850 / 1625 (0.1138) and screenshot 0.3451 / 4978.
+    # Requires pytesseract + the tesseract binary; _ocr_image degrades to no OCR
+    # if either is missing, so this is safe to leave on.
+    enabled: true
+  hierarchy:
+    build_doc_summary: false           # per-page caption is our L1; doc summary optional
+    max_levels: 3
+
+# -----------------------------------------------------------------------------
+# Cost model (token-equivalent; baked at ingestion, never re-computed)
+# -----------------------------------------------------------------------------
+cost:
+  text_chars_per_token: 4.0
+  visual_token_ratio: 1.2
+  image_token_budget_per_item: 256
+  pdf_page_token_budget: 1200          # full page screenshot
+  pdf_region_token_budget: 400
+  max_cost_normalizer: 6000.0
+
+# -----------------------------------------------------------------------------
+# Retrieval
+# -----------------------------------------------------------------------------
+retrieval:
+  fusion: "rrf"                         # rank-fuse text and visual scores robustly
+  rrf_k: 60
+  topk_text: 60                        # page-level recall was the hard ceiling (was 30)
+  topk_visual: 40                      # visual recall drove gold-page misses (was 15)
+  expand_to_family: true               # surface caption/screenshot/fulltext siblings
+  expand_to_neighbors: true
+  neighbor_score_decay: 0.15           # graph-only candidates must not crowd out direct hits
+  max_candidates: 160                  # keep the widened recall instead of truncating it (was 100)
+
+# -----------------------------------------------------------------------------
+# Router
+# -----------------------------------------------------------------------------
+router:
+  enabled: true
+  strategy: "submod_knapsack"          # "greedy_topm" | "submod_knapsack"
+  w_base: 0.4
+  w_bias: 0.3
+  w_type: 0.2
+  w_cost: 0.1
+  temperature: 1.0
+  modality_bias_confidence: 0.7
+  max_groups: 5
+  max_total_cost: 6000.0
+  beta: 1.0
+  confidence_mass_threshold: 0.95
+  submod_alpha: 1.0
+  submod_gamma: 0.35
+  submod_cost_beta: 0.20                # still prefer cheaper tiers, but do not veto evidence
+  min_relative_probability: 0.01        # 0.05 cut the set to 1.75 groups on a flat softmax
+  # Swept: kappa=3 gives the best efficiency (0.106 vs 0.094 at kappa=4) at a
+  # 1.5pp lower gold-page hit; kappa>=5 saturates because max_groups caps the
+  # selection at 5.  Kept at 4 as the balance point between the two.
+  min_distinct_pages: 4                 # cover >=4 source pages before the floor may stop us
+                                        # (measured: gold page is in top-3 candidates for 60/134
+                                        #  questions, top-5 for 69/134; 4 buys most of the gain
+                                        #  and still leaves the budget ~70% unused)
+  # campaign_20260824_035133: screenshots were 66.5% of Learned cost but 95% of
+  # that spend (110/116 picks) landed on non-Gold pages, because a screenshot
+  # was never the first pick and only appeared at ranks 3-4 as page-quota
+  # filler.  Restricting them to the first two picks cuts cost 2019 -> 1035
+  # (measured on that run's selections) for -0.75pp Gold page hit.
+  # Tier ablation for experiments.  Empty = use every tier (normal runs).
+  # Set to e.g. ["caption"] to measure what that tier is actually worth:
+  # campaign_20260830_123023 showed that when the router lands on the Gold page
+  # but picks caption it loses 0.226 F1 against oracle (48% UNKNOWN vs 10%),
+  # while picking screenshot matches oracle exactly.  Applies inside the
+  # selector, so every router is ablated identically.
+  # NOTE: a query whose candidates are ALL of a disabled tier keeps them, so the
+  # question is still answered rather than silently becoming a no-evidence case.
+  # Ablated runs can therefore still report a few picks of the disabled tier
+  # (e.g. locomo pages that only have captions) -- that is the fallback, not a
+  # leak.  Compare tier counts against the un-ablated run to see it.
+  disable_tiers: []
+  expensive_tier_cost: 800.0            # >= this token cost counts as expensive
+  expensive_tier_max_rank: 1            # expensive groups only at ranks 0-1; -1 disables
+  # Escape hatch so a genuinely visual question can still buy its page image.
+  # 0.3 -> 0.45 after campaign_20260829_045842 (subset=1000, 3 seeds):
+  # the learned softmax is flat enough at that scale that 0.3 blocked nothing --
+  # all 234 late screenshots had ratio >= 0.301, so the rank rule never fired
+  # and cost saving went to -8.6%.  Measured on those runs' own selections:
+  # Re-simulated with the BASELINE moving too (every router shares this
+  # selector, so a change here shifts zeroshot as well):
+  #   share  L_cost  Z_cost  vs zeroshot  Gold page hit
+  #   0.30   1418.6  1633.6    +13.2%       0.5075
+  #   0.45   1143.0  1622.5    +29.6%       0.5000   <- chosen
+  #   0.60   1072.9   607.2    -76.7%       0.5000   (0.6 + absolute floor)
+  # The 0.60 row is why campaign_20260830_123023 regressed to -41.6%: it was
+  # tuned by replaying only the learned router while holding zeroshot's
+  # recorded cost fixed, which cannot see the baseline move.
+  # Swept in the marathon run (n=134 each): 0.90 dominates the previously
+  # shipped 0.45 -- cost 1537 -> 1303 (-15%), F1 0.1674 -> 0.1684, F1/1k
+  # 0.109 -> 0.129 (+19%), at a 1.5pp cost in gold-page hit.  A stricter
+  # admission bar means an expensive tier must be near-top-ranked to be bought,
+  # which is exactly the intent of the rule.
+  expensive_tier_min_probability_share: 0.90
+  learned_retrieval_prior: 1.5          # page identity matters more than tier identity
+  family_mutex: true                   # same page → at most one cost tier selected
+  use_learned_scorer: false            # flipped to true by evaluate.py for the MLP run
+  router_model_path: ""
+  export_training_data: false          # train.py turns this on while collecting
+
+# -----------------------------------------------------------------------------
+# Labeling — auto-generate gold/minimal labels (replaces manual fill_gold_labels)
+# -----------------------------------------------------------------------------
+labeling:
+  mode: "both"                         # "evidence" | "distill" | "both"
+  answer_match: "substring"            # "substring" | "token_f1"
+  token_f1_threshold: 0.5
+
+# -----------------------------------------------------------------------------
+# Trainer — enhanced loss with cost-ladder terms (L_level + L_margin)
+# -----------------------------------------------------------------------------
+trainer:
+  input_dim: 28                         # 18 candidate/bias + 10 query-intent features
+  hidden_dim: 64
+  # Router network shape: linear | mlp1 | mlp2 | mlp3 (29 / 481 / 3969 / 14081
+  # parameters at input_dim 28). mlp2 is the shipped model; the others exist for
+  # the capacity ablation and are selected with ROUTER_ARCH.
+  architecture: "mlp2"
+  num_epochs: 400
+  validation_ratio: 0.15
+  early_stopping_patience: 30
+  early_stopping_min_delta: 1.0e-6
+  batch_size: 32                        # padded query batches; was 1 and took hours
+  learning_rate: 1.0e-3
+  lambda_route: 1.0
+  lambda_cost: 0.15                    # 0.5 made screenshots (12.9x caption) unpickable
+  lambda_level: 0.8                    # minimal labels carry the correct tier signal
+  lambda_margin: 0.1                   # weakened: it competed with L_level on tier choice
+  lambda_opd: 0.35                     # sequential on-policy teacher alignment
+  margin: 0.5                          # hinge margin for L_margin
+  use_minimal_sufficient: true
+  opd:
+    enabled: true                      # OPD applies to Router actions, not VLM tokens
+    run_ab: true                       # also train a same-seed no-OPD baseline
+    divergence: "reverse_kl"
+    rollout_steps: 5                   # partial evidence-set states per query
+    student_temperature: 1.0
+    teacher_temperature: 0.5
+    teacher_gold_bonus: 2.0
+    teacher_minimal_bonus: 1.5
+    teacher_retrieval_weight: 0.5
+    teacher_cost_weight: 0.75
+  device: "cuda"                       # "cuda" on GPU server | "cpu" on laptop
+  seed: 42
+
+llm:
+  backend: "openai_compatible"
+  base_url: "http://localhost:8000/v1"
+  api_key:  ""                         # use LLM_API_KEY / OPENAI_API_KEY env var
+  model:    "Qwen3-VL-8B-Instruct"                 # ← text-only model; pair with vision:false
+  vision:   true                     # set true ONLY if `model` is a vision VLM
+  max_tokens: 256                       # complete lists/comparisons; Judge has its own cap
+  max_images_per_call: 4
+  max_image_side: 1024                  # controls Qwen visual tokens/context length
+  image_jpeg_quality: 88
+  text_fallback_on_image_error: true    # use attached cached caption after image 500/400
+  # Without these the OpenAI SDK waits 600s and retries twice, so a single
+  # unresponsive hosted endpoint stalls a run for 30 minutes per call.
+  request_timeout: 90                   # seconds per call
+  max_retries: 1
+  # How many times to wait out a 429 and retry unchanged. Separate from
+  # max_retries, which varies the image payload and cannot help a rate limit.
+  rate_limit_retries: 3
+  # Ceiling for retrying an answer that came back empty because max_tokens cut
+  # it off before the model reached the answer (finish_reason="length").
+  max_answer_tokens: 2048
+
+backbones:
+  strong:                               # a stronger model: raises the Oracle ceiling
+    model:    "gpt-5.6-luna"                        # e.g. "gpt-4o", "claude-sonnet-4-5", "gemini-2.5-pro"
+    base_url: "https://api.openai.com/v1"                         # any OpenAI-compatible endpoint
+    api_key:  ""
+    vision:   true
+    max_questions: 50                   # hosted APIs bill per call; start small
+
+  mid:                                  # a mid-capacity model: checks the trend
+    model:    "qwen3-vl-flash"                        # e.g. "Qwen2.5-VL-7B-Instruct"
+    base_url: "http://127.0.0.1:8001/v1"                          # e.g. a local vLLM server
+    api_key:  ""
+    vision:   true
+    max_questions: 0                    # 0 = all test questions
+
+# -----------------------------------------------------------------------------
+# Evaluation
+# -----------------------------------------------------------------------------
+evaluation:
+  routers: ["rule", "zeroshot", "learned"]   # no-OPD baseline is auto-added when present
+  max_questions: 0                     # 0 = all in test split
+  answer_match: "token_f1"             # for EM/F1 scoring
+  lm_judge:
+    enabled: true                       # uses the same local OpenAI-compatible model
+    max_tokens: 128
